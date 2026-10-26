@@ -1,0 +1,7 @@
+for each app, configure:
+
+  {
+    "name": "WEBSITES_PORT",
+    "value": "3000",
+    "slotSetting": false
+  }
