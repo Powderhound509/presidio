@@ -373,6 +373,124 @@ class PDFSanitizationTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"existing")
         self.assertEqual(self.source.read_bytes(), self.original)
 
+    def test_when_short_pii_cannot_fit_then_reflow_keeps_complete_labels(self):
+        import pymupdf
+
+        source = self.source.with_name("short-name.pdf")
+        with pymupdf.open() as pdf:
+            pdf.new_page(width=300, height=200).insert_text(
+                (40, 60),
+                "Hello Al welcome",
+                fontsize=10,
+            )
+            pdf.save(source)
+        self.source = source
+
+        def short_name(text):
+            start = text.find("Al")
+            return (
+                [
+                    {
+                        "start": start,
+                        "end": start + 2,
+                        "score": 0.9,
+                        "entity_type": entity,
+                    }
+                    for entity in ("PERSON", "LOCATION")
+                ]
+                if start >= 0
+                else []
+            )
+
+        with patch.object(TOOLS, "_ocr", side_effect=self.ocr):
+            with self.assertRaisesRegex(RuntimeError, "fit legibly"):
+                TOOLS.sanitize_pdf(source, self.target, short_name, dpi=144)
+            summary = TOOLS.sanitize_pdf(
+                source,
+                self.target,
+                short_name,
+                dpi=144,
+                layout="reflow",
+            )
+        self.assertEqual(summary["label_types"], {"LOCATION": 1, "PERSON": 1})
+        with pymupdf.open(self.target) as pdf:
+            self.assertEqual(
+                pdf[0].get_text().strip(), "Hello <LOCATION> <PERSON> welcome"
+            )
+            self.assertEqual(pdf[0].get_images(), [])
+            self.assertEqual(pdf[0].rect, pymupdf.paper_rect("a4"))
+
+    def test_when_reflow_text_overflows_then_new_pages_preserve_every_word(self):
+        import pymupdf
+
+        text = "\n".join(["Public"] * 60)
+        geometry = [None if char == "\n" else (20, 20, 100, 50) for char in text]
+        with patch.object(TOOLS, "_ocr", return_value=(text, geometry)):
+            summary = TOOLS.sanitize_pdf(
+                self.source,
+                self.target,
+                lambda text: [],
+                dpi=144,
+                layout="reflow",
+            )
+        self.assertEqual(summary["pages"], 2)
+        with pymupdf.open(self.target) as pdf:
+            self.assertEqual(len(pdf), 2)
+            self.assertEqual(sum(page.get_text().count("Public") for page in pdf), 60)
+            self.assertEqual(pdf.embfile_count(), 0)
+            self.assertEqual(pdf.metadata["author"], "")
+            self.assertTrue(all(not page.get_images() for page in pdf))
+
+    def test_when_reflow_has_native_only_detections_then_labels_are_not_lost(self):
+        import pymupdf
+
+        with patch.object(TOOLS, "_ocr", return_value=("", [])):
+            summary = TOOLS.sanitize_pdf(
+                self.source,
+                self.target,
+                detect,
+                dpi=144,
+                layout="reflow",
+            )
+        self.assertEqual(summary["ocr_detections"], 0)
+        self.assertEqual(summary["text_detections"], 7)
+        with pymupdf.open(self.target) as pdf:
+            text = pdf[0].get_text()
+            for value, entity in VALUES.items():
+                self.assertNotIn(value, text)
+                self.assertIn(f"<{entity}>", text)
+            self.assertEqual(text.count("<EMAIL_ADDRESS>"), 2)
+
+    def test_when_reflow_label_is_long_then_it_remains_complete_and_unclipped(self):
+        import pymupdf
+
+        entity = "W" * 64
+
+        def long_label(text):
+            return [{**result, "entity_type": entity} for result in detect(text)]
+
+        with patch.object(TOOLS, "_ocr", side_effect=self.ocr):
+            TOOLS.sanitize_pdf(
+                self.source,
+                self.target,
+                long_label,
+                dpi=144,
+                layout="reflow",
+            )
+        with pymupdf.open(self.target) as pdf:
+            text = "".join(page.get_text() for page in pdf)
+            self.assertEqual(text.count(f"<{entity}>"), 7)
+            for page in pdf:
+                for word in page.get_text("words"):
+                    self.assertTrue(page.rect.contains(pymupdf.Rect(word[:4])))
+
+    def test_when_layout_is_invalid_then_processing_fails_before_ocr(self):
+        with patch.object(TOOLS, "_ocr") as ocr:
+            with self.assertRaisesRegex(ValueError, "layout"):
+                TOOLS.sanitize_pdf(self.source, self.target, detect, layout="invalid")
+        ocr.assert_not_called()
+        self.assertFalse(self.target.exists())
+
     def test_when_ocr_fails_then_output_is_refused(self):
         for message in ("Install Tesseract", "OCR returned low-confidence text"):
             with (
@@ -433,13 +551,22 @@ class PDFSanitizationTests(unittest.TestCase):
             page = output.new_page(width=600, height=800)
             page.insert_image(page.rect, pixmap=image)
             output.save(scan)
-        summary = TOOLS.sanitize_pdf(scan, self.target, detect, min_confidence=0)
-        self.assertEqual(summary["pages"], 1)
-        self.assertEqual(summary["text_detections"], 0)
-        with pymupdf.open(self.target) as pdf:
-            self.assertNotIn("alex@example.com", pdf[0].get_text())
-            self.assertIn("<EMAIL_ADDRESS>", pdf[0].get_text())
-            self.assertIn("Public", pdf[0].get_text())
+        for layout in ("preserve", "reflow"):
+            with self.subTest(layout=layout):
+                target = self.target.with_name(f"{layout}.pdf")
+                summary = TOOLS.sanitize_pdf(
+                    scan,
+                    target,
+                    detect,
+                    min_confidence=0,
+                    layout=layout,
+                )
+                self.assertEqual(summary["pages"], 1)
+                self.assertEqual(summary["text_detections"], 0)
+                with pymupdf.open(target) as pdf:
+                    self.assertNotIn("alex@example.com", pdf[0].get_text())
+                    self.assertIn("<EMAIL_ADDRESS>", pdf[0].get_text())
+                    self.assertIn("Public", pdf[0].get_text())
 
 
 if __name__ == "__main__":

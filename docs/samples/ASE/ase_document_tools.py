@@ -1038,7 +1038,8 @@ def _insert_pdf_word(page, text, box, font, *, visible, minimum=0):
     size = min(12, available_width / width, available_height / height) * 0.98
     if size < minimum or size <= 0:
         raise RuntimeError(
-            "A complete entity label cannot fit legibly; output refused."
+            "A complete entity label cannot fit legibly; "
+            "use layout='reflow'. Output refused."
         )
     if any(ord(char) > 255 or not font.has_glyph(ord(char)) for char in text):
         raise RuntimeError("PDF font cannot represent OCR text; output refused.")
@@ -1057,6 +1058,82 @@ def _insert_pdf_word(page, text, box, font, *, visible, minimum=0):
     )
 
 
+def _reflow_text(text, geometry, regions, image):
+    remaining = set(range(len(regions)))
+    parts, previous_end = [], 0
+    words = _searchable_words(text, geometry, [], image)
+    for match, (word, box) in zip(re.finditer(r"\S+", text), words):
+        hits = [
+            index for index, (region, _) in enumerate(regions) if _touches(box, region)
+        ]
+        if parts:
+            parts.append("\n" if "\n" in text[previous_end : match.start()] else " ")
+        if hits:
+            for index in hits:
+                if index in remaining:
+                    parts.append(
+                        " ".join(f"<{entity}>" for entity in sorted(regions[index][1]))
+                    )
+                    parts.append(" ")
+                    remaining.remove(index)
+        else:
+            parts.append(word)
+        previous_end = match.end()
+    # Native detections without OCR words must still be represented in the output.
+    for index in sorted(remaining):
+        parts.append("\n")
+        parts.append(" ".join(f"<{entity}>" for entity in sorted(regions[index][1])))
+    return "".join(parts)
+
+
+def _write_reflow_pdf(output, text, font, minimum):
+    import pymupdf
+
+    paragraphs = [line.split() for line in text.splitlines()]
+    words = [word for paragraph in paragraphs for word in paragraph]
+    if any(
+        ord(char) > 255 or not font.has_glyph(ord(char))
+        for word in words
+        for char in word
+    ):
+        raise RuntimeError("PDF font cannot represent OCR text; output refused.")
+    rect, margin = pymupdf.paper_rect("a4"), 36
+    available_width = rect.width - 2 * margin
+    longest = max((font.text_length(word, fontsize=1) for word in words), default=1)
+    size = min(max(12, minimum), available_width / longest * 0.98)
+    if size < minimum:
+        raise RuntimeError(
+            "A reflow word cannot fit at the minimum font size; output refused."
+        )
+    line_height = size * max(1.5, font.ascender - font.descender)
+    if line_height > rect.height - 2 * margin:
+        raise RuntimeError("Reflow font size exceeds the page height; output refused.")
+    before = len(output)
+    page = output.new_page(width=rect.width, height=rect.height)
+    y = margin + font.ascender * size
+
+    def write_line(line):
+        nonlocal page, y
+        if y - font.descender * size > rect.height - margin:
+            page = output.new_page(width=rect.width, height=rect.height)
+            y = margin + font.ascender * size
+        if line:
+            page.insert_text((margin, y), line, fontsize=size, fontname="helv")
+        y += line_height
+
+    for paragraph in paragraphs:
+        line = ""
+        for word in paragraph:
+            candidate = f"{line} {word}" if line else word
+            if line and font.text_length(candidate, fontsize=size) > available_width:
+                write_line(line)
+                line = word
+            else:
+                line = candidate
+        write_line(line)
+    return len(output) - before
+
+
 def sanitize_pdf(
     source,
     target,
@@ -1067,6 +1144,7 @@ def sanitize_pdf(
     tesseract="tesseract",
     min_confidence=50,
     min_label_fontsize=6,
+    layout="preserve",
 ):
     """Replace detected PDF PII with labels and a filtered searchable OCR layer.
 
@@ -1078,7 +1156,9 @@ def sanitize_pdf(
     :param tesseract: Tesseract executable name or path.
     :param min_confidence: Minimum acceptable OCR word confidence.
     :param min_label_fontsize: Minimum complete label size in PDF points.
-    :return: Page, native/OCR detection, and label-type counts; never PII values.
+    :param layout: "preserve" for sanitized page images, or "reflow" for a new
+        text-only A4 PDF with complete labels, wrapping, and pagination.
+    :return: Output page, native/OCR detection, and label-type counts; never PII values.
     :raises ValueError: Invalid configuration or unsupported input.
     :raises RuntimeError: OCR, analysis, geometry, font, or label-fit failure.
     :raises FileExistsError: Output already exists or aliases the input.
@@ -1089,6 +1169,8 @@ def sanitize_pdf(
     source, target = _paths(source, target, ".pdf")
     if source.suffix.lower() != ".pdf" or type(dpi) is not int or dpi < 144:
         raise ValueError("Use PDF input and an integer resolution of at least 144 DPI.")
+    if layout not in ("preserve", "reflow"):
+        raise ValueError('PDF layout must be "preserve" or "reflow".')
     if (
         type(min_label_fontsize) not in (int, float)
         or not math.isfinite(min_label_fontsize)
@@ -1136,6 +1218,17 @@ def sanitize_pdf(
                 regions.extend(_labeled_regions(text, geometry, detections, image))
                 summary[counter] += len(detections)
             regions = _merge_labeled_regions(regions)
+            for _, entities in regions:
+                for entity in entities:
+                    summary["label_types"][entity] = (
+                        summary["label_types"].get(entity, 0) + 1
+                    )
+            if layout == "reflow":
+                sanitized = _reflow_text(ocr_text, ocr_geometry, regions, image)
+                summary["pages"] += _write_reflow_pdf(
+                    output, sanitized, font, min_label_fontsize,
+                )
+                continue
             draw = ImageDraw.Draw(image)
             for box, _ in regions:
                 draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), fill="white")
@@ -1164,10 +1257,6 @@ def sanitize_pdf(
                     visible=True,
                     minimum=min_label_fontsize,
                 )
-                for entity in entities:
-                    summary["label_types"][entity] = (
-                        summary["label_types"].get(entity, 0) + 1
-                    )
             summary["pages"] += 1
         with _new_output(target) as temporary:
             output.save(str(temporary), garbage=4, deflate=True)
