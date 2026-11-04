@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "presidio-document-worker"
+version = "0.1.0"
+description = "Private, keyless ASE document jobs for Synapse and ADF"
+requires-python = ">=3.10,<3.15"
+dependencies = []
+
+[project.optional-dependencies]
+worker = [
+    "azure-identity>=1.25,<2",
+    "azure-storage-blob>=12.27,<13",
+    "azure-storage-queue>=12.14,<13",
+    "defusedxml>=0.7.1,<0.8",
+    "openpyxl>=3.1.5,<4",
+    "pillow>=12,<13",
+    "pymupdf>=1.26.6,<2",
+    "pyodbc>=5.3,<6",
+    "requests>=2.32.5,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.4,<10", "ruff>=0.14,<1", "build>=1.3,<2"]
+
+[project.scripts]
+presidio-document-worker = "presidio_document_worker.runtime:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/presidio_document_worker"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../ase_document_tools.py" = "ase_document_tools.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ase_document_tools", "presidio_document_worker"]
+
+[tool.ruff.lint.per-file-ignores]
+# Standard-library discovery also runs without an editable package installation.
+"**/tests/*.py" = ["E402"]

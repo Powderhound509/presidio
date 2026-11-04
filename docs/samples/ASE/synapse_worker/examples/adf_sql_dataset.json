@@ -1,0 +1,8 @@
+{
+  "name": "DocumentJobsSql",
+  "properties": {
+    "linkedServiceName": {"referenceName": "ApprovedDocumentSql", "type": "LinkedServiceReference"},
+    "type": "AzureSqlTable",
+    "typeProperties": {"schema": "docjobs", "table": "Jobs"}
+  }
+}
