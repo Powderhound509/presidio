@@ -1,0 +1,12 @@
+[
+  {
+    "name": "document-worker-mi",
+    "object_id": "00000000-0000-0000-0000-000000000001",
+    "role": "document_worker"
+  },
+  {
+    "name": "synapse-workspace-mi",
+    "object_id": "00000000-0000-0000-0000-000000000008",
+    "role": "document_submitter"
+  }
+]

@@ -125,11 +125,13 @@ def _detections(data, text):
     return data
 
 
-def _intervals(detections, text):
+def _intervals(detections, text, *, merge_adjacent=True):
     spans = sorted((d["start"], d["end"]) for d in _detections(detections, text))
     merged = []
     for start, end in spans:
-        if merged and start <= merged[-1][1]:
+        if merged and (
+            start < merged[-1][1] or (merge_adjacent and start == merged[-1][1])
+        ):
             merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
         else:
             merged.append((start, end))
@@ -461,16 +463,20 @@ def _paint(image, text, geometry, analyze, *, redact):
     return len(spans)
 
 
-def _word_images(files, analyze, *, redact, ocr_language, tesseract, min_confidence):
+def _word_images(files, analyze, *, redact, ocr_language, tesseract, min_confidence,
+                 ocr_provider=None, image_transform=None):
     count = 0
     for name in files:
         if name.startswith("word/media/"):
             image, format_name = _image(files[name])
-            text, geometry = _ocr(
+            text, geometry = ocr_provider(image) if ocr_provider is not None else _ocr(
                 image, language=ocr_language, command=tesseract,
                 min_confidence=min_confidence,
             )
-            count += _paint(image, text, geometry, analyze, redact=redact)
+            if image_transform is not None:
+                count += image_transform(image, text, geometry)
+            else:
+                count += _paint(image, text, geometry, analyze, redact=redact)
             stream = io.BytesIO()
             image.save(stream, format="PNG" if redact else format_name)
             files[name] = stream.getvalue()
@@ -504,7 +510,7 @@ def _story_xml(root, original):
 
 
 def annotate_word(source, target, analyze, *, libreoffice="soffice", ocr_language="eng",
-                  tesseract="tesseract", min_confidence=50):
+                  tesseract="tesseract", min_confidence=50, ocr_provider=None):
     """Highlight Word text and OCR-detected text in embedded raster images.
 
     :param source: DOCX or legacy DOC input.
@@ -514,6 +520,7 @@ def annotate_word(source, target, analyze, *, libreoffice="soffice", ocr_languag
     :param ocr_language: Installed Tesseract language code(s).
     :param tesseract: Tesseract executable.
     :param min_confidence: Minimum OCR word confidence, otherwise refuse output.
+    :param ocr_provider: Optional image-to-(text, geometry) callable; bypasses Tesseract.
     :return: Counts only, never input text.
     :raises ValueError: Unsupported input features.
     :raises RuntimeError: Analysis, OCR, or conversion failure.
@@ -527,7 +534,7 @@ def annotate_word(source, target, analyze, *, libreoffice="soffice", ocr_languag
         )
         image_count = _word_images(
             files, analyze, redact=False, ocr_language=ocr_language,
-            tesseract=tesseract, min_confidence=min_confidence,
+            tesseract=tesseract, min_confidence=min_confidence, ocr_provider=ocr_provider,
         )
         for name, root in stories.items():
             files[name] = _story_xml(root, files[name])
@@ -535,9 +542,11 @@ def annotate_word(source, target, analyze, *, libreoffice="soffice", ocr_languag
     return {"text_detections": text_count, "image_detections": image_count}
 
 
-def _clean_paragraph(paragraph, analyze, picture):
+def _clean_paragraph(paragraph, analyze, picture, replacement=None):
     text, entries = _paragraph_text(paragraph, visible_only=True)
-    spans = _intervals(analyze(text), text) if text else []
+    spans = _intervals(
+        analyze(text), text, merge_adjacent=replacement is None
+    ) if text else []
     result = ET.Element(f"{{{W}}}p")
     offset, span_index = 0, 0
     for run in paragraph.iter(f"{{{W}}}r"):
@@ -568,7 +577,9 @@ def _clean_paragraph(paragraph, analyze, picture):
                 if containing is None:
                     pieces.append(character)
                 elif position == containing[0]:
-                    pieces.append("[REDACTED]")
+                    pieces.append(
+                        replacement(text, *containing) if replacement else "[REDACTED]"
+                    )
             offset += len(value)
             if not pieces:
                 continue
@@ -619,7 +630,8 @@ def _picture_xml(relationship_id, width, height, picture_id):
 
 
 def redact_word(source, target, analyze, *, libreoffice="soffice", ocr_language="eng",
-                tesseract="tesseract", min_confidence=50):
+                tesseract="tesseract", min_confidence=50, ocr_provider=None,
+                replacement=None, image_transform=None):
     """Rebuild a fresh DOCX with replaced text and OCR-scrubbed pictures.
 
     :param source: DOCX or legacy DOC input.
@@ -629,6 +641,9 @@ def redact_word(source, target, analyze, *, libreoffice="soffice", ocr_language=
     :param ocr_language: Installed Tesseract language code(s).
     :param tesseract: Tesseract executable.
     :param min_confidence: Minimum OCR word confidence.
+    :param ocr_provider: Optional OCR callable; no Tesseract call when supplied.
+    :param replacement: Optional (text, start, end)-to-string replacement callable.
+    :param image_transform: Optional image/text/geometry transformer returning a count.
     :return: Text/image detection counts only.
     :raises ValueError: Unsupported document features.
     :raises RuntimeError: Conversion, OCR, analysis, or geometry failure.
@@ -673,6 +688,7 @@ def redact_word(source, target, analyze, *, libreoffice="soffice", ocr_language=
         image_count = _word_images(
             files, analyze, redact=True, ocr_language=ocr_language,
             tesseract=tesseract, min_confidence=min_confidence,
+            ocr_provider=ocr_provider, image_transform=image_transform,
         )
         output = {}
         content_types = ET.Element(f"{{{CT}}}Types")
@@ -721,7 +737,7 @@ def redact_word(source, target, analyze, *, libreoffice="soffice", ocr_language=
             def block(node):
                 nonlocal text_count
                 if node.tag == f"{{{W}}}p":
-                    clean, count = _clean_paragraph(node, analyze, picture)
+                    clean, count = _clean_paragraph(node, analyze, picture, replacement)
                     text_count += count
                     return clean
                 if node.tag == f"{{{W}}}tbl":

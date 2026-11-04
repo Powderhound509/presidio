@@ -1,0 +1,23 @@
+{
+  "identity": "user",
+  "client_id": "00000000-0000-0000-0000-000000000001",
+  "blob_endpoint": "https://approvedstorage.blob.core.usgovcloudapi.net",
+  "queue_endpoint": "https://approvedstorage.queue.core.usgovcloudapi.net",
+  "input_container": "documents-raw",
+  "output_container": "documents-results",
+  "queue_name": "document-jobs",
+  "sql_server": "approvedsql.database.usgovcloudapi.net",
+  "sql_database": "documents",
+  "analyzer_endpoint": "https://approvedanalyzer.approvedase.appserviceenvironment.us",
+  "analyzer_resource": "api://00000000-0000-0000-0000-000000000002",
+  "ocr_endpoint": "https://approvedocr.cognitiveservices.azure.us",
+  "ocr_scope": "https://cognitiveservices.azure.us/.default",
+  "ocr_api_version": "2023-07-31",
+  "ocr_min_confidence": 0.8,
+  "ocr_validated": false,
+  "processing_enabled": false,
+  "lease_seconds": 180,
+  "job_timeout_seconds": 1800,
+  "max_attempts": 3,
+  "poll_seconds": 5
+}

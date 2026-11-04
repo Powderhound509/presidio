@@ -1,0 +1,97 @@
+{
+  "name": "ProcessDocumentReference",
+  "properties": {
+    "variables": {"jobStatus": {"type": "String", "defaultValue": "queued"}},
+    "parameters": {
+      "documentId": {"type": "String"},
+      "versionId": {"type": "String"},
+      "extension": {"type": "String", "defaultValue": "pdf"},
+      "inputETag": {"type": "String"},
+      "operation": {"type": "String", "defaultValue": "redact"},
+      "language": {"type": "String", "defaultValue": "en"}
+    },
+    "activities": [
+      {
+        "name": "Submit",
+        "type": "Lookup",
+        "policy": {
+          "timeout": "0.00:02:00", "retry": 2, "retryIntervalInSeconds": 30,
+          "secureInput": true, "secureOutput": true
+        },
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "sqlReaderStoredProcedureName": "docjobs.Submit",
+            "storedProcedureParameters": {
+              "document_id": {"type": "Guid", "value": {"value": "@pipeline().parameters.documentId", "type": "Expression"}},
+              "version_id": {"type": "Guid", "value": {"value": "@pipeline().parameters.versionId", "type": "Expression"}},
+              "extension": {"type": "String", "value": {"value": "@pipeline().parameters.extension", "type": "Expression"}},
+              "input_etag": {"type": "String", "value": {"value": "@pipeline().parameters.inputETag", "type": "Expression"}},
+              "operation": {"type": "String", "value": {"value": "@pipeline().parameters.operation", "type": "Expression"}},
+              "language": {"type": "String", "value": {"value": "@pipeline().parameters.language", "type": "Expression"}},
+              "policy": {"type": "String", "value": "native-v1"}
+            }
+          },
+          "dataset": {"referenceName": "DocumentJobsSql", "type": "DatasetReference"},
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "WaitForTerminal",
+        "type": "Until",
+        "dependsOn": [{"activity": "Submit", "dependencyConditions": ["Succeeded"]}],
+        "typeProperties": {
+          "expression": {
+            "type": "Expression",
+            "value": "@contains(createArray('succeeded','succeeded_with_warnings','failed','dead_letter'), variables('jobStatus'))"
+          },
+          "timeout": "0.01:00:00",
+          "activities": [
+            {"name": "PollDelay", "type": "Wait", "typeProperties": {"waitTimeInSeconds": 15}},
+            {
+              "name": "Status",
+              "type": "Lookup",
+              "dependsOn": [{"activity": "PollDelay", "dependencyConditions": ["Succeeded"]}],
+              "policy": {"secureInput": true, "secureOutput": true, "retry": 2, "retryIntervalInSeconds": 30},
+              "typeProperties": {
+                "source": {
+                  "type": "AzureSqlSource",
+                  "sqlReaderStoredProcedureName": "docjobs.Status",
+                  "storedProcedureParameters": {
+                    "job_id": {
+                      "type": "Guid",
+                      "value": {"type": "Expression", "value": "@activity('Submit').output.firstRow.job_id"}
+                    }
+                  }
+                },
+                "dataset": {"referenceName": "DocumentJobsSql", "type": "DatasetReference"},
+                "firstRowOnly": true
+              }
+            },
+            {
+              "name": "RememberStatus",
+              "type": "SetVariable",
+              "dependsOn": [{"activity": "Status", "dependencyConditions": ["Succeeded"]}],
+              "typeProperties": {
+                "variableName": "jobStatus",
+                "value": {"type": "Expression", "value": "@activity('Status').output.firstRow.status"}
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "RequireSuccess",
+        "type": "IfCondition",
+        "dependsOn": [{"activity": "WaitForTerminal", "dependencyConditions": ["Succeeded"]}],
+        "typeProperties": {
+          "expression": {"type": "Expression", "value": "@contains(createArray('succeeded','succeeded_with_warnings'), variables('jobStatus'))"},
+          "ifFalseActivities": [
+            {"name": "ProcessingFailed", "type": "Fail", "typeProperties": {"errorCode": "document_processing_failed", "message": "Inspect the authorized SQL job status; document processing did not succeed."}}
+          ],
+          "ifTrueActivities": []
+        }
+      }
+    ]
+  }
+}

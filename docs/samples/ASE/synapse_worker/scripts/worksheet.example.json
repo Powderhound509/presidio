@@ -1,0 +1,17 @@
+{
+  "graphEndpoint": "https://graph.microsoft.us",
+  "rbac": [
+    {
+      "principalId": "00000000-0000-0000-0000-000000000001",
+      "role": "Storage Blob Data Reader",
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000005/resourceGroups/APPROVED/providers/Microsoft.Storage/storageAccounts/APPROVED/blobServices/default/containers/documents-raw"
+    }
+  ],
+  "appRoles": [
+    {
+      "principalId": "00000000-0000-0000-0000-000000000001",
+      "resourcePrincipalId": "00000000-0000-0000-0000-000000000006",
+      "appRoleId": "00000000-0000-0000-0000-000000000007"
+    }
+  ]
+}
