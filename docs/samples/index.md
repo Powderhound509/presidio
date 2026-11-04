@@ -12,6 +12,7 @@
 | Usage | Images       | Python Notebook                     | [Redacting Text PII from DICOM images](python/example_dicom_image_redactor.ipynb)
 | Usage | Images        | Python Notebook                    | [Using an allow list with image redaction](python/image_redaction_allow_list_approach.ipynb)
 | Usage | PDF   | Python Notebook                            | [Annotating PII in a PDF](python/example_pdf_annotation.ipynb)
+| Usage | PDF (text/scanned) | Python Notebook | [Sanitizing searchable PDFs with PII entity labels using an ASE analyzer](ASE/presidio_pdf_sanitization.ipynb) |
 | Usage | Images     | Python Notebook                       | [Plot custom bounding boxes](python/plot_custom_bboxes.ipynb)
 | Usage | Text     | Python Notebook                         | [Integrating with external services](python/integrating_with_external_services.ipynb) |
 | Usage | Text       | Python file                           | [Remote Recognizer](python/example_remote_recognizer.py) |

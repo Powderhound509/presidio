@@ -875,3 +875,300 @@ def redact_pdf(source, target, analyze, *, dpi=200, ocr_language="eng",
         with _new_output(target) as temporary:
             output.save(str(temporary), garbage=4, deflate=True)
         return {"pages": len(original), "text_detections": text_count, "ocr_detections": image_count}
+
+
+def _pdf_native_text(page, image):
+    import pymupdf
+
+    for block in page.get_text("rawdict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        parts, geometry = [], []
+        for line in block["lines"]:
+            if parts:
+                parts.append("\n")
+                geometry.append(None)
+            for span in line["spans"]:
+                for char in span["chars"]:
+                    parts.append(char["c"])
+                    rect = pymupdf.Rect(char["bbox"]) * page.rotation_matrix
+                    box = (
+                        rect.x0 * image.width / page.rect.width,
+                        rect.y0 * image.height / page.rect.height,
+                        rect.x1 * image.width / page.rect.width,
+                        rect.y1 * image.height / page.rect.height,
+                    )
+                    geometry.extend([box] * len(char["c"]))
+        yield "".join(parts), geometry
+
+
+def _checked_box(box, image):
+    if (
+        len(box) != 4
+        or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in box
+        )
+        or not 0 <= box[0] < box[2] <= image.width
+        or not 0 <= box[1] < box[3] <= image.height
+    ):
+        raise RuntimeError("Invalid sanitization geometry; output refused.")
+    return tuple(box)
+
+
+def _touches(left, right):
+    return (
+        left[0] <= right[2]
+        and right[0] <= left[2]
+        and left[1] <= right[3]
+        and right[1] <= left[3]
+    )
+
+
+def _union_boxes(boxes):
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def _labeled_regions(text, geometry, detections, image):
+    if len(text) != len(geometry):
+        raise RuntimeError(
+            "Text and sanitization geometry do not align; output refused."
+        )
+    regions = []
+    for detection in _detections(detections, text):
+        entity = detection["entity_type"]
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", entity):
+            raise RuntimeError(
+                "Entity labels must be uppercase identifiers; output refused."
+            )
+        lines, boxes = [], []
+        for index in range(detection["start"], detection["end"]):
+            if text[index] == "\n" and boxes:
+                lines.append(boxes)
+                boxes = []
+            if geometry[index] is not None:
+                boxes.append(_checked_box(geometry[index], image))
+        if boxes:
+            lines.append(boxes)
+        if not lines:
+            raise RuntimeError("A detection has no visible geometry; output refused.")
+        for line in lines:
+            x0, y0, x1, y1 = _union_boxes(line)
+            regions.append(
+                (
+                    (
+                        max(0, math.floor(x0) - 2),
+                        max(0, math.floor(y0) - 2),
+                        min(image.width, math.ceil(x1) + 2),
+                        min(image.height, math.ceil(y1) + 2),
+                    ),
+                    {entity},
+                )
+            )
+    return regions
+
+
+def _merge_labeled_regions(regions):
+    merged = []
+    for box, entities in sorted(regions, key=lambda region: region[0]):
+        remaining = list(merged)
+        merged = []
+        while remaining:
+            other, types = remaining.pop()
+            axis = (
+                0
+                if (
+                    box[3] - box[1] > box[2] - box[0]
+                    and other[3] - other[1] > other[2] - other[0]
+                )
+                else 1
+            )
+            center_distance = abs(
+                (box[axis] + box[axis + 2]) / 2 - (other[axis] + other[axis + 2]) / 2
+            )
+            # Padding can overlap adjacent lines; keep their labels separate.
+            same_line = (
+                center_distance
+                <= min(
+                    box[axis + 2] - box[axis],
+                    other[axis + 2] - other[axis],
+                )
+                / 2
+            )
+            if _touches(box, other) and same_line:
+                box = _union_boxes([box, other])
+                entities = entities | types
+                # The expanded box can now intersect an earlier region.
+                remaining.extend(merged)
+                merged = []
+            else:
+                merged.append((other, types))
+        merged.append((box, entities))
+    return sorted(merged, key=lambda region: (region[0][1], region[0][0]))
+
+
+def _searchable_words(text, geometry, regions, image):
+    if len(text) != len(geometry):
+        raise RuntimeError("OCR text and geometry do not align; output refused.")
+    for match in re.finditer(r"\S+", text):
+        entries = geometry[match.start() : match.end()]
+        if any(entry is None for entry in entries):
+            raise RuntimeError("An OCR word has missing geometry; output refused.")
+        box = _union_boxes([_checked_box(entry, image) for entry in entries])
+        if not any(_touches(box, region) for region, _ in regions):
+            yield match.group(), box
+
+
+def _insert_pdf_word(page, text, box, font, *, visible, minimum=0):
+    import pymupdf
+
+    rect = pymupdf.Rect(box)
+    rotate = 90 if rect.height > rect.width else 0
+    available_width, available_height = (
+        (rect.height, rect.width) if rotate else (rect.width, rect.height)
+    )
+    width = font.text_length(text, fontsize=1)
+    height = font.ascender - font.descender
+    if not width or not height:
+        raise RuntimeError("Cannot measure PDF text; output refused.")
+    size = min(12, available_width / width, available_height / height) * 0.98
+    if size < minimum or size <= 0:
+        raise RuntimeError(
+            "A complete entity label cannot fit legibly; output refused."
+        )
+    if any(ord(char) > 255 or not font.has_glyph(ord(char)) for char in text):
+        raise RuntimeError("PDF font cannot represent OCR text; output refused.")
+    origin = (
+        (rect.x0 + font.ascender * size, rect.y1)
+        if rotate
+        else (rect.x0, rect.y0 + font.ascender * size)
+    )
+    page.insert_text(
+        origin,
+        text,
+        fontsize=size,
+        fontname="helv",
+        rotate=rotate,
+        render_mode=0 if visible else 3,
+    )
+
+
+def sanitize_pdf(
+    source,
+    target,
+    analyze,
+    *,
+    dpi=200,
+    ocr_language="eng",
+    tesseract="tesseract",
+    min_confidence=50,
+    min_label_fontsize=6,
+):
+    """Replace detected PDF PII with labels and a filtered searchable OCR layer.
+
+    :param source: Native-text, scanned, or mixed PDF input.
+    :param target: New PDF output; existing files are never overwritten.
+    :param analyze: Callable returning Presidio detection dictionaries.
+    :param dpi: Page rendering resolution, at least 144 DPI.
+    :param ocr_language: Installed Tesseract language code(s).
+    :param tesseract: Tesseract executable name or path.
+    :param min_confidence: Minimum acceptable OCR word confidence.
+    :param min_label_fontsize: Minimum complete label size in PDF points.
+    :return: Page, native/OCR detection, and label-type counts; never PII values.
+    :raises ValueError: Invalid configuration or unsupported input.
+    :raises RuntimeError: OCR, analysis, geometry, font, or label-fit failure.
+    :raises FileExistsError: Output already exists or aliases the input.
+    """
+    import pymupdf
+    from PIL import Image, ImageDraw
+
+    source, target = _paths(source, target, ".pdf")
+    if source.suffix.lower() != ".pdf" or type(dpi) is not int or dpi < 144:
+        raise ValueError("Use PDF input and an integer resolution of at least 144 DPI.")
+    if (
+        type(min_label_fontsize) not in (int, float)
+        or not math.isfinite(min_label_fontsize)
+        or min_label_fontsize < 6
+    ):
+        raise ValueError("Minimum label font size must be at least 6 PDF points.")
+    summary = {"pages": 0, "text_detections": 0, "ocr_detections": 0, "label_types": {}}
+    font = pymupdf.Font("helv")
+    with pymupdf.open(source) as original, pymupdf.open() as output:
+        if not original.is_pdf or original.needs_pass or not 1 <= len(original) <= 200:
+            raise ValueError(
+                "Encrypted, empty, or more-than-200-page PDFs are unsupported."
+            )
+        for page in original:
+            if (
+                math.ceil(page.rect.width * dpi / 72)
+                * math.ceil(page.rect.height * dpi / 72)
+                > MAX_PIXELS
+            ):
+                raise ValueError(
+                    "Rendered page exceeds the pixel limit; "
+                    "reduce DPI or split the document."
+                )
+            pixmap = page.get_pixmap(
+                dpi=dpi, colorspace=pymupdf.csRGB, alpha=False, annots=True
+            )
+            image = Image.frombytes(
+                "RGB", (pixmap.width, pixmap.height), pixmap.samples
+            )
+            ocr_text, ocr_geometry = _ocr(
+                image,
+                language=ocr_language,
+                command=tesseract,
+                min_confidence=min_confidence,
+            )
+            regions = []
+            for text, geometry, counter in [
+                (ocr_text, ocr_geometry, "ocr_detections"),
+                *(
+                    (text, boxes, "text_detections")
+                    for text, boxes in _pdf_native_text(page, image)
+                ),
+            ]:
+                detections = _detections(analyze(text), text) if text else []
+                regions.extend(_labeled_regions(text, geometry, detections, image))
+                summary[counter] += len(detections)
+            regions = _merge_labeled_regions(regions)
+            draw = ImageDraw.Draw(image)
+            for box, _ in regions:
+                draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), fill="white")
+            stream = io.BytesIO()
+            image.save(stream, format="PNG")
+            clean = output.new_page(width=page.rect.width, height=page.rect.height)
+            clean.insert_image(clean.rect, stream=stream.getvalue())
+
+            def points(box):
+                return (
+                    box[0] * clean.rect.width / image.width,
+                    box[1] * clean.rect.height / image.height,
+                    box[2] * clean.rect.width / image.width,
+                    box[3] * clean.rect.height / image.height,
+                )
+
+            for word, box in _searchable_words(ocr_text, ocr_geometry, regions, image):
+                _insert_pdf_word(clean, word, points(box), font, visible=False)
+            for box, entities in regions:
+                label = " ".join(f"<{entity}>" for entity in sorted(entities))
+                _insert_pdf_word(
+                    clean,
+                    label,
+                    points(box),
+                    font,
+                    visible=True,
+                    minimum=min_label_fontsize,
+                )
+                for entity in entities:
+                    summary["label_types"][entity] = (
+                        summary["label_types"].get(entity, 0) + 1
+                    )
+            summary["pages"] += 1
+        with _new_output(target) as temporary:
+            output.save(str(temporary), garbage=4, deflate=True)
+    return summary
